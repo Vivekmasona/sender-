@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>FM P2P — Receiver</title>
+<style>
+  :root{--card:#081826;--muted:#9fb3bf;--accent:#00ff7a}
+  body{font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial;background:linear-gradient(180deg,#041018,#071017);color:#eafff0;padding:18px;max-width:920px;margin:18px auto}
+  .card{background:var(--card);padding:16px;border-radius:12px;border:1px solid rgba(255,255,255,0.03)}
+  h1{margin:0 0 8px;font-size:20px}
+  .row{display:flex;gap:10px;align-items:center;margin:12px 0;flex-wrap:wrap}
+  label{min-width:90px;color:var(--muted)}
+  button{padding:8px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.04);background:linear-gradient(90deg,#04212a,#08363a);color:#eafaf1;cursor:pointer}
+  .indicator{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:8px}
+  .green{background:linear-gradient(180deg,#00d977,#00ff7a);box-shadow:0 0 8px rgba(0,255,122,0.12)}
+  .red{background:linear-gradient(180deg,#ff6b6b,#ff4d6d);box-shadow:0 0 8px rgba(255,77,109,0.08)}
+  progress{width:100%;height:14px;border-radius:8px;background:#04131a}
+  .small{font-size:13px;color:var(--muted)}
+  #receiveBtn.shake{animation:shake 0.8s infinite}
+  @keyframes shake{0%{transform:translateX(0)}25%{transform:translateX(-6px)}50%{transform:translateX(6px)}75%{transform:translateX(-4px)}100%{transform:translateX(0)}}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>📥 Receiver</h1>
+    <div class="row">
+      <label>Signaling</label>
+      <div class="small">wss://fmconnector.onrender.com/ws</div>
+    </div>
+
+    <div class="row">
+      <label>Status</label>
+      <div style="display:flex;align-items:center">
+        <span id="dot" class="indicator red"></span>
+        <span id="statusText" class="small">Disconnected</span>
+      </div>
+      <div style="margin-left:auto"><button id="connBtn">Connect</button></div>
+    </div>
+
+    <hr/>
+
+    <div class="row">
+      <label>Incoming</label>
+      <div>
+        <div id="incomingName" class="small">No file</div>
+        <div id="incomingSize" class="small"></div>
+      </div>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <label class="small"><input id="autoDl" type="checkbox" checked/> Auto-download</label>
+        <button id="receiveBtn" disabled>Receive</button>
+        <button id="saveBtn" disabled style="display:none">Save</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>Progress</label>
+      <div style="flex:1">
+        <progress id="recvProgress" value="0" max="100"></progress>
+        <div id="recvInfo" class="small">Idle</div>
+      </div>
+      <div style="min-width:120px;text-align:right" class="small">From: <span id="fromPeer">--</span></div>
+    </div>
+  </div>
+
+<script>
+const SIGNALING = 'wss://fmconnector.onrender.com/ws';
+const ICE = [{urls:'stun:stun.l.google.com:19302'}];
+const BUFFERED_LOW = 8 * 1024 * 1024;
+
+const connBtn = document.getElementById('connBtn');
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('statusText');
+const incomingNameEl = document.getElementById('incomingName');
+const incomingSizeEl = document.getElementById('incomingSize');
+const receiveBtn = document.getElementById('receiveBtn');
+const saveBtn = document.getElementById('saveBtn');
+const autoDl = document.getElementById('autoDl');
+const recvProgress = document.getElementById('recvProgress');
+const recvInfo = document.getElementById('recvInfo');
+const fromPeer = document.getElementById('fromPeer');
+
+let ws = null;
+let pc = null;
+let recvDc = null;
+let recvBuffer = [];
+let recvSize = 0;
+let expectedSize = 0;
+let incomingName = '';
+let recvBlobUrl = null;
+let activePeer = null;
+
+function setStatus(connected){
+  if(connected){ dot.classList.remove('red'); dot.classList.add('green'); statusText.textContent = 'Connected (signaling)'; }
+  else { dot.classList.remove('green'); dot.classList.add('red'); statusText.textContent = 'Disconnected'; }
+}
+
+connBtn.onclick = () => {
+  connBtn.disabled = true;
+  connect().catch(e=>{ alert('Connect failed'); connBtn.disabled=false; console.error(e); });
+};
+
+function connect(){
+  return new Promise((resolve,reject) => {
+    ws = new WebSocket(SIGNALING);
+    ws.onopen = () => { ws.send(JSON.stringify({type:'register', role:'listener'})); };
+    ws.onmessage = async (ev) => { try{ const msg = JSON.parse(ev.data); await handleMessage(msg); }catch(e){ console.warn('bad msg', e); } };
+    ws.onclose = () => { setStatus(false); connBtn.disabled=false; };
+    ws.onerror = (e) => { console.error('ws err', e); reject(e); };
+    // resolve when registered
+    const wait = setInterval(()=>{ if(pc!==null || ws && ws.readyState===WebSocket.OPEN){} },200);
+    // do not block—we rely on server messages; immediate resolve to allow UI flow
+    resolve();
+  });
+}
+
+async function handleMessage(msg){
+  switch(msg.type){
+    case 'registered':
+      setStatus(true);
+      break;
+    case 'offer':
+      // offer from broadcaster
+      activePeer = msg.from;
+      fromPeer.textContent = activePeer;
+      await handleOffer(msg.from, msg.payload);
+      break;
+    case 'candidate':
+      if(pc && msg.payload){
+        try{ await pc.addIceCandidate(msg.payload); }catch(e){ console.warn('candidate add failed', e); }
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+async function handleOffer(fromId, offer){
+  pc = new RTCPeerConnection({iceServers: ICE});
+  pc.ondatachannel = (evt) => { setupRecvDC(evt.channel); };
+  pc.onicecandidate = (e) => { if(e.candidate) ws.send(JSON.stringify({type:'candidate', target:fromId, payload: e.candidate})); };
+  pc.onconnectionstatechange = () => {
+    if(pc.connectionState === 'connected'){ setStatus(true); receiveBtn.disabled = false; }
+    if(pc.connectionState === 'disconnected' || pc.connectionState === 'failed'){ setStatus(false); receiveBtn.disabled = true; }
+  };
+  await pc.setRemoteDescription(offer);
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  ws.send(JSON.stringify({type:'answer', target:fromId, payload: pc.localDescription}));
+  recvInfo.textContent = 'Answer sent';
+}
+
+// set up receiving datachannel
+function setupRecvDC(dc){
+  recvDc = dc;
+  recvDc.binaryType = 'arraybuffer';
+  recvDc.onopen = () => { console.log('recv dc open'); recvInfo.textContent='Channel open'; };
+  recvDc.onmessage = (evt) => { onChunk(evt.data); };
+  recvDc.onclose = () => { console.log('recv dc closed'); };
+  recvDc.onerror = (e) => console.error('recv dc err', e);
+}
+
+function onChunk(data){
+  if(typeof data === 'string'){
+    if(data === 'EOF'){ finalize(); return; }
+    try{
+      const meta = JSON.parse(data);
+      incomingName = meta.filename || 'download';
+      expectedSize = meta.filesize || 0;
+      recvBuffer = [];
+      recvSize = 0;
+      incomingNameEl.textContent = incomingName;
+      incomingSizeEl.textContent = expectedSize ? `${expectedSize} bytes` : '';
+      recvProgress.value = 0;
+      recvInfo.textContent = 'Receiving...';
+      receiveBtn.disabled = false;
+      receiveBtn.classList.add('shake'); // shake to notify
+      // show/hide save button
+      if(!autoDl.checked){ saveBtn.style.display = 'inline-block'; saveBtn.disabled = true; }
+      else { saveBtn.style.display = 'none'; }
+      return;
+    }catch(e){}
+  }
+  // binary
+  recvBuffer.push(data);
+  recvSize += data.byteLength;
+  if(expectedSize) recvProgress.value = Math.floor((recvSize/expectedSize)*100);
+  recvInfo.textContent = `${Math.round(recvSize/1024/1024*100)/100} MB received`;
+}
+
+// finalize and either auto-download or enable manual save
+function finalize(){
+  const blob = new Blob(recvBuffer);
+  if(recvBlobUrl) URL.revokeObjectURL(recvBlobUrl);
+  recvBlobUrl = URL.createObjectURL(blob);
+  receiveBtn.classList.remove('shake');
+  receiveBtn.disabled = true;
+  recvInfo.textContent = 'Complete';
+  if(autoDl.checked){
+    const a = document.createElement('a');
+    a.href = recvBlobUrl;
+    a.download = incomingName || 'download';
+    a.click();
+    recvInfo.textContent = 'Auto-saved';
+  } else {
+    saveBtn.disabled = false;
+    saveBtn.style.display = 'inline-block';
+    saveBtn.onclick = () => {
+      const a = document.createElement('a');
+      a.href = recvBlobUrl;
+      a.download = incomingName || 'download';
+      a.click();
+    };
+  }
+  alert('File received');
+}
+
+receiveBtn.onclick = () => { /* button is simply an attention control, actual reception happens automatically */ };
+
+</script>
+</body>
+</html>
