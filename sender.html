@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>FM P2P — Sender</title>
+<style>
+  :root{--bg:#071017;--card:#081826;--muted:#9fb3bf;--accent:#00ff7a}
+  body{font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial;background:linear-gradient(180deg,#041018,#071017);color:#eafff0;padding:18px;max-width:920px;margin:18px auto}
+  .card{background:var(--card);padding:16px;border-radius:12px;border:1px solid rgba(255,255,255,0.03)}
+  h1{margin:0 0 8px;font-size:20px}
+  .row{display:flex;gap:10px;align-items:center;margin:12px 0;flex-wrap:wrap}
+  label{min-width:90px;color:var(--muted)}
+  input[type="file"]{color:var(--muted)}
+  button{padding:8px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.04);background:linear-gradient(90deg,#0f2230,#083041);color:#eafaf1;cursor:pointer}
+  .indicator{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:8px}
+  .green{background:linear-gradient(180deg,#00d977,#00ff7a);box-shadow:0 0 8px rgba(0,255,122,0.12)}
+  .red{background:linear-gradient(180deg,#ff6b6b,#ff4d6d);box-shadow:0 0 8px rgba(255,77,109,0.08)}
+  progress{width:100%;height:14px;border-radius:8px;background:#04131a}
+  .small{font-size:13px;color:var(--muted)}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>📤 Sender</h1>
+    <div class="row">
+      <label>Signaling</label>
+      <div class="small">wss://fmconnector.onrender.com/ws</div>
+    </div>
+
+    <div class="row">
+      <label>Status</label>
+      <div style="display:flex;align-items:center">
+        <span id="dot" class="indicator red"></span>
+        <span id="statusText" class="small">Disconnected</span>
+      </div>
+      <div style="margin-left:auto">
+        <button id="connBtn">Connect</button>
+      </div>
+    </div>
+
+    <hr/>
+
+    <div class="row">
+      <label>Choose file</label>
+      <input id="fileInput" type="file" />
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <select id="chunkSel">
+          <option value="16384">16 KB</option>
+          <option value="65536" selected>64 KB</option>
+          <option value="262144">256 KB</option>
+        </select>
+        <button id="sendBtn" disabled>Send File</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <label>Progress</label>
+      <div style="flex:1">
+        <progress id="sendProgress" value="0" max="100"></progress>
+        <div id="sendInfo" class="small">Idle</div>
+      </div>
+      <div style="min-width:120px;text-align:right" class="small">Peer: <span id="peerId">--</span></div>
+    </div>
+  </div>
+
+<script>
+const SIGNALING = 'wss://fmconnector.onrender.com/ws';
+const ICE = [{urls:'stun:stun.l.google.com:19302'}];
+const BUFFERED_LOW = 8 * 1024 * 1024; // 8MB
+
+// UI
+const connBtn = document.getElementById('connBtn');
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('statusText');
+const fileInput = document.getElementById('fileInput');
+const sendBtn = document.getElementById('sendBtn');
+const chunkSel = document.getElementById('chunkSel');
+const sendProgress = document.getElementById('sendProgress');
+const sendInfo = document.getElementById('sendInfo');
+const peerIdEl = document.getElementById('peerId');
+
+let ws = null;
+let myId = null;
+let pc = null;
+let dc = null;
+let activePeer = null;
+
+function setStatus(connected){
+  if(connected){ dot.classList.remove('red'); dot.classList.add('green'); statusText.textContent = 'Connected (signaling)'; }
+  else { dot.classList.remove('green'); dot.classList.add('red'); statusText.textContent = 'Disconnected'; }
+}
+
+connBtn.onclick = () => {
+  connBtn.disabled = true;
+  connect().catch(e=>{ alert('Connect failed'); connBtn.disabled = false; console.error(e); });
+};
+
+function connect(){
+  return new Promise((resolve, reject) => {
+    ws = new WebSocket(SIGNALING);
+    ws.onopen = () => { ws.send(JSON.stringify({type:'register', role:'broadcaster'})); };
+    ws.onmessage = async (ev) => {
+      try{
+        const msg = JSON.parse(ev.data);
+        await handleMessage(msg);
+      }catch(e){ console.warn('bad msg', e); }
+    };
+    ws.onclose = () => { setStatus(false); connBtn.disabled = false; };
+    ws.onerror = (e) => { console.error('ws err', e); reject(e); };
+    // wait for registered
+    const wait = setInterval(()=>{
+      if(myId){ clearInterval(wait); setStatus(true); resolve(); }
+    },150);
+  });
+}
+
+async function handleMessage(msg){
+  switch(msg.type){
+    case 'registered':
+      myId = msg.id;
+      statusText.textContent = `Connected as ${myId}`;
+      break;
+    case 'listener-joined':
+      // server tells broadcaster that a listener connected (msg.id)
+      activePeer = msg.id;
+      peerIdEl.textContent = activePeer;
+      // create peer & offer
+      await createPeer(activePeer);
+      break;
+    case 'answer':
+      if(msg.from && pc && msg.payload) {
+        await pc.setRemoteDescription(msg.payload);
+      }
+      break;
+    case 'candidate':
+      if(msg.from && pc && msg.payload){
+        try{ await pc.addIceCandidate(msg.payload); }catch(e){ console.warn('candidate failed', e); }
+      }
+      break;
+    default:
+      // ignore
+      break;
+  }
+}
+
+// create a peer connection and datachannel to the listener
+async function createPeer(peerId){
+  pc = new RTCPeerConnection({iceServers: ICE});
+  pc.onicecandidate = (e) => { if(e.candidate) ws.send(JSON.stringify({type:'candidate', target:peerId, payload: e.candidate})); };
+  pc.onconnectionstatechange = () => {
+    if(pc.connectionState === 'connected'){ sendInfo.textContent = 'Peer connected'; sendBtn.disabled = false; }
+    if(pc.connectionState === 'disconnected' || pc.connectionState==='failed'){ sendInfo.textContent = 'Peer disconnected'; sendBtn.disabled = true; }
+  };
+
+  dc = pc.createDataChannel('file');
+  dc.binaryType = 'arraybuffer';
+  dc.bufferedAmountLowThreshold = BUFFERED_LOW;
+  dc.onopen = () => console.log('DC open');
+  dc.onclose = () => console.log('DC close');
+  dc.onerror = (e) => console.error('DC err', e);
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  ws.send(JSON.stringify({type:'offer', target:peerId, payload: pc.localDescription}));
+  sendInfo.textContent = 'Offer sent — waiting for answer';
+}
+
+// sending logic
+sendBtn.onclick = async () => {
+  const file = fileInput.files[0];
+  if(!file) return alert('Choose a file');
+  if(!dc || dc.readyState !== 'open') return alert('DataChannel not open yet');
+  sendBtn.disabled = true;
+  sendProgress.value = 0;
+  sendInfo.textContent = 'Sending...';
+  const chunkSize = parseInt(chunkSel.value,10);
+  // send metadata
+  dc.send(JSON.stringify({ filename: file.name, filesize: file.size }));
+  let offset = 0;
+  const start = performance.now();
+  while(offset < file.size){
+    const slice = await file.slice(offset, offset + chunkSize).arrayBuffer();
+    // backpressure
+    if(dc.bufferedAmount > BUFFERED_LOW){
+      await new Promise(res => {
+        const l = () => { dc.removeEventListener('bufferedamountlow', l); res(); };
+        dc.addEventListener('bufferedamountlow', l);
+      });
+    }
+    dc.send(slice);
+    offset += slice.byteLength;
+    sendProgress.value = Math.floor((offset / file.size) * 100);
+    const elapsed = (performance.now() - start) / 1000;
+    const mbps = (offset/1024/1024) / elapsed;
+    sendInfo.textContent = `${sendProgress.value}% — ${Math.round(offset/1024/1024*100)/100} MB — ${mbps.toFixed(2)} MB/s`;
+  }
+  // EOF
+  dc.send('EOF');
+  sendInfo.textContent = 'Send complete';
+  alert('File sent to listener.');
+  sendBtn.disabled = false;
+};
+</script>
+</body>
+</html>
