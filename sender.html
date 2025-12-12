@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>FM P2P — Sender</title>
+<title>FM P2P â€” Sender</title>
 <style>
   :root{--bg:#071017;--card:#081826;--muted:#9fb3bf;--accent:#00ff7a}
   body{font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial;background:linear-gradient(180deg,#041018,#071017);color:#eafff0;padding:18px;max-width:920px;margin:18px auto}
@@ -22,7 +22,7 @@
 </head>
 <body>
   <div class="card">
-    <h1>📤 Sender</h1>
+    <h1>ðŸ“¤ Sender</h1>
     <div class="row">
       <label>Signaling</label>
       <div class="small">wss://fmconnector.onrender.com/ws</div>
@@ -42,15 +42,15 @@
     <hr/>
 
     <div class="row">
-      <label>Select</label>
-      <input id="fileInput" type="file" multiple webkitdirectory />
+      <label>Choose file</label>
+      <input id="fileInput" type="file" />
       <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
         <select id="chunkSel">
           <option value="16384">16 KB</option>
           <option value="65536" selected>64 KB</option>
           <option value="262144">256 KB</option>
         </select>
-        <button id="sendBtn" disabled>Send</button>
+        <button id="sendBtn" disabled>Send File</button>
       </div>
     </div>
 
@@ -67,7 +67,7 @@
 <script>
 const SIGNALING = 'wss://fmconnector.onrender.com/ws';
 const ICE = [{urls:'stun:stun.l.google.com:19302'}];
-const BUFFERED_LOW = 8 * 1024 * 1024;
+const BUFFERED_LOW = 8 * 1024 * 1024; // 8MB
 
 // UI
 const connBtn = document.getElementById('connBtn');
@@ -108,7 +108,7 @@ function connect(){
     };
     ws.onclose = () => { setStatus(false); connBtn.disabled = false; };
     ws.onerror = (e) => { console.error('ws err', e); reject(e); };
-
+    // wait for registered
     const wait = setInterval(()=>{
       if(myId){ clearInterval(wait); setStatus(true); resolve(); }
     },150);
@@ -121,113 +121,87 @@ async function handleMessage(msg){
       myId = msg.id;
       statusText.textContent = `Connected as ${myId}`;
       break;
-
     case 'listener-joined':
+      // server tells broadcaster that a listener connected (msg.id)
       activePeer = msg.id;
       peerIdEl.textContent = activePeer;
+      // create peer & offer
       await createPeer(activePeer);
       break;
-
     case 'answer':
       if(msg.from && pc && msg.payload) {
         await pc.setRemoteDescription(msg.payload);
       }
       break;
-
     case 'candidate':
       if(msg.from && pc && msg.payload){
         try{ await pc.addIceCandidate(msg.payload); }catch(e){ console.warn('candidate failed', e); }
       }
       break;
+    default:
+      // ignore
+      break;
   }
 }
 
+// create a peer connection and datachannel to the listener
 async function createPeer(peerId){
   pc = new RTCPeerConnection({iceServers: ICE});
-
-  pc.onicecandidate = (e) => {
-    if(e.candidate)
-      ws.send(JSON.stringify({type:'candidate', target:peerId, payload:e.candidate}));
-  };
-
+  pc.onicecandidate = (e) => { if(e.candidate) ws.send(JSON.stringify({type:'candidate', target:peerId, payload: e.candidate})); };
   pc.onconnectionstatechange = () => {
-    if(pc.connectionState === 'connected'){
-      sendInfo.textContent = 'Peer connected';
-      sendBtn.disabled = false;
-    }
-    if(pc.connectionState === 'disconnected' || pc.connectionState === 'failed'){
-      sendInfo.textContent = 'Peer disconnected';
-      sendBtn.disabled = true;
-    }
+    if(pc.connectionState === 'connected'){ sendInfo.textContent = 'Peer connected'; sendBtn.disabled = false; }
+    if(pc.connectionState === 'disconnected' || pc.connectionState==='failed'){ sendInfo.textContent = 'Peer disconnected'; sendBtn.disabled = true; }
   };
 
   dc = pc.createDataChannel('file');
   dc.binaryType = 'arraybuffer';
   dc.bufferedAmountLowThreshold = BUFFERED_LOW;
+  dc.onopen = () => console.log('DC open');
+  dc.onclose = () => console.log('DC close');
+  dc.onerror = (e) => console.error('DC err', e);
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-
-  ws.send(JSON.stringify({type:'offer', target:peerId, payload:pc.localDescription}));
-
-  sendInfo.textContent = 'Offer sent — waiting for answer';
+  ws.send(JSON.stringify({type:'offer', target:peerId, payload: pc.localDescription}));
+  sendInfo.textContent = 'Offer sent â€” waiting for answer';
 }
 
+// sending logic
 sendBtn.onclick = async () => {
-
-  const files = fileInput.files;
-  if(!files.length) return alert('Select files or a folder');
-
-  if(!dc || dc.readyState !== 'open') return alert('DataChannel not ready');
-
+  const file = fileInput.files[0];
+  if(!file) return alert('Choose a file');
+  if(!dc || dc.readyState !== 'open') return alert('DataChannel not open yet');
   sendBtn.disabled = true;
-
-  for (let file of files) {
-
-    sendProgress.value = 0;
-    sendInfo.textContent = `Sending: ${file.name}`;
-
-    const chunkSize = parseInt(chunkSel.value,10);
-
-    // File metadata send
-    dc.send(JSON.stringify({
-      filename: file.webkitRelativePath || file.name,
-      filesize: file.size
-    }));
-
-    let offset = 0;
-    const start = performance.now();
-
-    while (offset < file.size) {
-
-      const slice = await file.slice(offset, offset + chunkSize).arrayBuffer();
-
-      if(dc.bufferedAmount > BUFFERED_LOW){
-        await new Promise(res => {
-          const l = () => { dc.removeEventListener('bufferedamountlow', l); res(); };
-          dc.addEventListener('bufferedamountlow', l);
-        });
-      }
-
-      dc.send(slice);
-      offset += slice.byteLength;
-
-      sendProgress.value = Math.floor((offset / file.size) * 100);
-
-      const elapsed = (performance.now() - start) / 1000;
-      const mbps = (offset/1024/1024) / elapsed;
-
-      sendInfo.textContent =
-        `${file.name} — ${sendProgress.value}% — ${Math.round(offset/1024/1024*100)/100} MB — ${mbps.toFixed(2)} MB/s`;
+  sendProgress.value = 0;
+  sendInfo.textContent = 'Sending...';
+  const chunkSize = parseInt(chunkSel.value,10);
+  // send metadata
+  dc.send(JSON.stringify({ filename: file.name, filesize: file.size }));
+  let offset = 0;
+  const start = performance.now();
+  while(offset < file.size){
+    const slice = await file.slice(offset, offset + chunkSize).arrayBuffer();
+    // backpressure
+    if(dc.bufferedAmount > BUFFERED_LOW){
+      await new Promise(res => {
+        const l = () => { dc.removeEventListener('bufferedamountlow', l); res(); };
+        dc.addEventListener('bufferedamountlow', l);
+      });
     }
-
-    dc.send('EOF'); // file finished
+    dc.send(slice);
+    offset += slice.byteLength;
+    sendProgress.value = Math.floor((offset / file.size) * 100);
+    const elapsed = (performance.now() - start) / 1000;
+    const mbps = (offset/1024/1024) / elapsed;
+    sendInfo.textContent = `${sendProgress.value}% â€” ${Math.round(offset/1024/1024*100)/100} MB â€” ${mbps.toFixed(2)} MB/s`;
   }
-
-  sendInfo.textContent = 'All files sent';
-  alert('All files sent successfully!');
+  // EOF
+  dc.send('EOF');
+  sendInfo.textContent = 'Send complete';
+  alert('File sent to listener.');
   sendBtn.disabled = false;
 };
 </script>
 </body>
 </html>
+
